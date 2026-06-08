@@ -1,0 +1,43 @@
+# Maven
+target/
+!.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.project
+.classpath
+.factorypath
+.springBeans
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Java
+*.class
+*.jar
+*.war
+*.log
+hs_err_pid*
+replay_pid*
+
+# Build
+build/
+out/
+dist/
+.gradle/
+
+# Misc
+*.tmp
+*.bak
+.env
