@@ -22,8 +22,6 @@
         <spring-boot.version>3.4.1</spring-boot.version>
         <picocli.version>4.7.6</picocli.version>
         <jackson.version>2.18.2</jackson.version>
-        <slf4j.version>2.0.16</slf4j.version>
-        <logback.version>1.5.15</logback.version>
 
         <!-- Test -->
         <junit.version>5.11.4</junit.version>
@@ -75,16 +73,10 @@
             <optional>true</optional>
         </dependency>
 
-        <!-- Logging -->
-        <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-api</artifactId>
-            <version>${slf4j.version}</version>
-        </dependency>
+        <!-- Logging (版本由 Spring Boot BOM 管理，不再显式覆盖) -->
         <dependency>
             <groupId>ch.qos.logback</groupId>
             <artifactId>logback-classic</artifactId>
-            <version>${logback.version}</version>
         </dependency>
 
         <!-- Template engine (Jinja2 → Mustache) -->
@@ -122,7 +114,7 @@
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <version>${spring-boot.version}</version>
                 <configuration>
-                    <excludes>
+                    <exclusion>
                         <exclude>
                             <groupId>org.projectlombok</groupId>
                             <artifactId>lombok</artifactId>

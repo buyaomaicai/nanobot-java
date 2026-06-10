@@ -41,3 +41,6 @@ dist/
 *.tmp
 *.bak
 .env
+
+# Secrets — API keys must never be committed
+llm-config.json
