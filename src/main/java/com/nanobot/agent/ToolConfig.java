@@ -1,8 +1,7 @@
 package com.nanobot.agent;
 
 import com.nanobot.tool.ToolRegistry;
-import com.nanobot.tool.builtin.EchoTool;
-import com.nanobot.tool.builtin.TimeTool;
+import com.nanobot.tool.builtin.*;
 import jakarta.annotation.PostConstruct;
 import org.springframework.context.annotation.Configuration;
 
@@ -20,6 +19,16 @@ public class ToolConfig {
 
     @PostConstruct
     void registerBuiltins() {
+        // filesystem
+        registry.register(new ReadFileTool());
+        registry.register(new WriteFileTool());
+        registry.register(new EditFileTool());
+        // shell
+        registry.register(new ShellTool());
+        // web
+        registry.register(new WebSearchTool());
+        registry.register(new FetchUrlTool());
+        // diagnostics
         registry.register(new EchoTool());
         registry.register(new TimeTool());
     }
