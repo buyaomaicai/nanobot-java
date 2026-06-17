@@ -1,10 +1,9 @@
 package com.nanobot;
 
+import com.nanobot.agent.AgentLoop;
 import com.nanobot.bus.InboundMessage;
 import com.nanobot.bus.MessageBus;
 import com.nanobot.bus.OutboundMessage;
-import com.nanobot.provider.LLMProvider;
-import com.nanobot.session.Session;
 import com.nanobot.session.SessionManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -13,7 +12,6 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
 
-import java.util.Map;
 import java.util.Scanner;
 
 /**
@@ -36,10 +34,8 @@ public class NanobotApplication {
     @Bean
     CommandLineRunner cliRunner(MessageBus bus,
                                 SessionManager sessionManager,
-                                LLMProvider llmProvider) {
+                                AgentLoop agentLoop) {
         return args -> {
-            final String sessionKey = "cli:default";
-            Session session = sessionManager.getOrCreate(sessionKey);
 
             log.info("Nanobot CLI started.  Type a message, or /exit to quit.");
 
@@ -85,30 +81,13 @@ public class NanobotApplication {
                                     .build());
                             break;
                         }
-
-                        // build conversation history
-                        session.addMessage("user", in.getContent());
-                        var history = session.getHistory(120);
-
-                        // call LLM
-                        var response = llmProvider.chat(history);
-
-                        // record reply
-                        session.addMessage("assistant", response.content(),
-                                Map.of("tool_calls", response.toolCalls()));
-
-                        // push to outbound
-                        bus.publishOutbound(OutboundMessage.builder()
-                                .channel("cli")
-                                .chatId("default")
-                                .content(response.content())
-                                .build());
+                        agentLoop.processOne(in);
                     }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
-                // persist on exit
-                try { sessionManager.save(session, true); } catch (Exception e) { log.warn("save failed", e); }
+                // persist sessions on exit
+                try { sessionManager.flushAll(); } catch (Exception e) { log.warn("flush failed", e); }
                 log.info("Agent thread exiting.");
             }, "nanobot-agent");
 

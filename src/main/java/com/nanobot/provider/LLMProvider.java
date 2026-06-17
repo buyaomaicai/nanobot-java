@@ -1,5 +1,6 @@
 package com.nanobot.provider;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -8,14 +9,21 @@ import java.util.Map;
  *
  * <p>Mirrors {@code nanobot/providers/base.py :: LLMProvider}.</p>
  */
-@FunctionalInterface
 public interface LLMProvider {
 
     /**
-     * Send a list of conversation messages to the LLM and return the response.
+     * Send messages to the LLM. Convenience overload without tool definitions.
+     */
+    default LLMResponse chat(List<Map<String, Object>> messages) {
+        return chat(messages, Collections.emptyList());
+    }
+
+    /**
+     * Send messages and tool definitions to the LLM.
      *
-     * @param messages ordered conversation history (role/content/tool_calls/…)
+     * @param messages  ordered conversation history (role/content/tool_calls/…)
+     * @param tools     OpenAI-format tool definitions (empty if tools are unavailable)
      * @return the model's text response and optional tool calls
      */
-    LLMResponse chat(List<Map<String, Object>> messages);
+    LLMResponse chat(List<Map<String, Object>> messages, List<Map<String, Object>> tools);
 }

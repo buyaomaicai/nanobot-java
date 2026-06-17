@@ -13,7 +13,7 @@ import java.util.Map;
 public class SimpleLLMProvider implements LLMProvider {
 
     @Override
-    public LLMResponse chat(List<Map<String, Object>> messages) {
+    public LLMResponse chat(List<Map<String, Object>> messages, List<Map<String, Object>> tools) {
         // extract the last user message for context-aware echo
         String lastUserContent = "(empty)";
         for (int i = messages.size() - 1; i >= 0; i--) {

@@ -49,7 +49,7 @@ public class DeepSeekProvider implements LLMProvider {
     // ── implementation ──────────────────────────────────────────────
 
     @Override
-    public LLMResponse chat(List<Map<String, Object>> messages) {
+    public LLMResponse chat(List<Map<String, Object>> messages, List<Map<String, Object>> tools) {
         // ① 清洗消息：仅保留 OpenAI API 认可的字段，移除 timestamp 等额外字段
         List<Map<String, Object>> cleanMessages = new ArrayList<>();
         for (Map<String, Object> msg : messages) {
@@ -76,7 +76,14 @@ public class DeepSeekProvider implements LLMProvider {
         body.put("temperature", config.temperature());
         body.put("stream", false);
 
-         log.debug("DeepSeek request  model={}  messages={}", config.model(), cleanMessages.size());
+        // ③ 附加工具定义（仅在非空时发送，避免 API 空数组校验错误）
+        if (tools != null && !tools.isEmpty()) {
+            body.put("tools", tools);
+        }
+
+        log.debug("DeepSeek request  model={}  messages={}  tools={}",
+                config.model(), cleanMessages.size(),
+                tools != null ? tools.size() : 0);
 
         // ② 发送 POST，同步等待结果（Agent 线程本身就是阻塞模型，.block() 合理）
         String raw;
@@ -137,8 +144,25 @@ public class DeepSeekProvider implements LLMProvider {
                         k -> usage.put(k, usageNode.get(k).asInt()));
             }
 
-            // tool calls (if any — for future use)
+            // tool calls — parse from OpenAI format:
+            //   tool_calls: [{ id, type, function: { name, arguments } }]
+            //   arguments is a *JSON string*, not a nested object — need double-parse
             List<ToolCallRequest> toolCalls = new ArrayList<>();
+            JsonNode toolCallsNode = first.path("message").path("tool_calls");
+            if (toolCallsNode.isArray()) {
+                for (JsonNode tc : toolCallsNode) {
+                    String callId = tc.path("id").asText("");
+                    String callName = tc.path("function").path("name").asText("");
+                    String argsRaw = tc.path("function").path("arguments").asText("{}");
+                    try {
+                        Map<String, Object> args = mapper.readValue(argsRaw,
+                                new com.fasterxml.jackson.core.type.TypeReference<>() {});
+                        toolCalls.add(new ToolCallRequest(callId, callName, args));
+                    } catch (Exception e) {
+                        log.warn("Failed to parse tool-call arguments for {}: {}", callName, e.toString());
+                    }
+                }
+            }
 
             return new LLMResponse(content, toolCalls, finishReason, usage);
         } catch (Exception e) {
