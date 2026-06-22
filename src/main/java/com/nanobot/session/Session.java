@@ -105,8 +105,18 @@ public class Session {
         metadata.remove("_last_summary");
     }
 
-    /** Mark all current messages as consolidated (for memory compaction). */
+    /**
+     * Compact: physically trim old messages, keep the last few as bridging context.
+     * After this call {@code lastConsolidated} is reset to 0 so the kept messages
+     * remain visible in the next turn.  The consolidated facts live in MEMORY.md.
+     */
     public void markConsolidated() {
-        lastConsolidated = messages.size();
+        int keep = Math.min(messages.size(), 10);
+        if (messages.size() > keep) {
+            int from = messages.size() - keep;
+            messages = new ArrayList<>(messages.subList(from, messages.size()));
+        }
+        lastConsolidated = 0;  // retained messages still need context
+        updatedAt = Instant.now();
     }
 }

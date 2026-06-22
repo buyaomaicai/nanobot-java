@@ -1,11 +1,15 @@
 package com.nanobot.agent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nanobot.agent.memory.Consolidator;
+import com.nanobot.agent.memory.MemStore;
 import com.nanobot.bus.InboundMessage;
 import com.nanobot.bus.MessageBus;
+import com.nanobot.bus.MessageConstants;
 import com.nanobot.bus.OutboundMessage;
 import com.nanobot.provider.LLMProvider;
 import com.nanobot.provider.LLMResponse;
+import com.nanobot.provider.StreamCallback;
 import com.nanobot.provider.ToolCallRequest;
 import com.nanobot.session.Session;
 import com.nanobot.session.SessionManager;
@@ -17,6 +21,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -53,6 +59,11 @@ public class AgentLoop {
     private final SessionManager sessions;
     private final ToolRegistry toolRegistry;
     private final String workspace;
+    private final MemStore memStore;
+    private final Consolidator consolidator;
+
+    /** Auto-compact when session messages exceed this count. */
+    private static final int COMPACT_THRESHOLD = 100;
 
     public AgentLoop(MessageBus bus,
                      LLMProvider llm,
@@ -64,6 +75,8 @@ public class AgentLoop {
         this.sessions = sessions;
         this.toolRegistry = toolRegistry;
         this.workspace = workspace;
+        this.memStore = new MemStore(Path.of(workspace));
+        this.consolidator = new Consolidator(llm);
     }
 
     // ── main entry ────────────────────────────────────────────────────
@@ -76,26 +89,84 @@ public class AgentLoop {
         String sessionKey = msg.getSessionKey();
         Session session = sessions.getOrCreate(sessionKey);
 
+        String userContent = msg.getContent();
+
+        // ── /compact 命令：手动触发记忆压缩 ──────────────
+        if ("/compact".equals(userContent)) {
+            handleCompact(session, msg);
+            return;
+        }
+
         // ① 记录用户消息
-        session.addMessage("user", msg.getContent());
+        session.addMessage("user", userContent);
 
         // ② 获取工具列表（给 LLM 看的"菜单"）
         List<Map<String, Object>> toolDefs = toolRegistry.getDefinitions();
 
-        // ③ tool-calling 循环
+        // ③ tool-calling 循环（全部使用 streaming 模式）
         for (int round = 0; round < MAX_TOOL_ROUNDS; round++) {
-            List<Map<String, Object>> history = session.getHistory(120);
-            LLMResponse resp = llm.chat(history, toolDefs);
+            List<Map<String, Object>> history = augmentWithMemory(session.getHistory(120));
+
+            // 用数组做可变容器（lambda 内不能改局部变量）
+            LLMResponse[] resultHolder = new LLMResponse[1];
+
+            llm.chatStream(history, toolDefs, new StreamCallback() {
+                @Override
+                public void onToken(String text) {
+                    log.debug("onToken ({} chars): {}", text.length(),
+                            text.length() > 50 ? text.substring(0, 50) + "…" : text);
+                    try {
+                        bus.publishOutbound(OutboundMessage.builder()
+                                .channel(msg.getChannel())
+                                .chatId(msg.getChatId())
+                                .content(text)
+                                .metadata(Map.of(
+                                        MessageConstants.OUTBOUND_META_STREAM_PROGRESS, true))
+                                .build());
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+
+                @Override
+                public void onComplete(LLMResponse response) {
+                    resultHolder[0] = response;
+                }
+
+                @Override
+                public void onError(Throwable error) {
+                    log.warn("Streaming failed, falling back to non-streaming: {}", error.toString());
+                    try {
+                        LLMResponse fallback = llm.chat(history, toolDefs);
+                        // fallback succeeded: send the full content as one "token" event
+                        if (fallback.content() != null && !fallback.content().isEmpty()) {
+                            onToken(fallback.content());
+                        }
+                        resultHolder[0] = fallback;
+                    } catch (Exception e) {
+                        log.error("Fallback chat also failed", e);
+                    }
+                }
+            });
+
+            LLMResponse resp = resultHolder[0];
+            if (resp == null) {
+                log.error("chatStream completed without response");
+                return;
+            }
 
             // ④ 纯文本回复 — 任务完成
             if (!resp.hasToolCalls()) {
                 session.addMessage("assistant", resp.content());
+                // 发送一个空内容消息作为"换行"信号（终端从 \r 模式切换到 \n 模式）
                 bus.publishOutbound(OutboundMessage.builder()
                         .channel(msg.getChannel())
                         .chatId(msg.getChatId())
-                        .content(resp.content())
+                        .content("")
                         .build());
                 log.debug("Agent complete  session={}  rounds={}", sessionKey, round + 1);
+                // auto-compact if too many messages
+                maybeAutoCompact(session);
                 return;
             }
 
@@ -166,5 +237,68 @@ public class AgentLoop {
         kwargs.put("tool_call_id", tc.id());
         kwargs.put("name", tc.name());
         return kwargs;
+    }
+
+    // ── memory ─────────────────────────────────────────────────────────
+
+    /**
+     * Prepend long-term memory as a system message to the conversation history.
+     * The augmented list is not persisted back to Session.
+     */
+    private List<Map<String, Object>> augmentWithMemory(List<Map<String, Object>> history) {
+        String memory = memStore.readAll();
+        if (memory.isBlank()) return history;
+
+        List<Map<String, Object>> augmented = new ArrayList<>(history.size() + 1);
+        augmented.add(Map.of("role", "system", "content", "## 长期记忆\n" + memory));
+        augmented.addAll(history);
+        return augmented;
+    }
+
+    /** Compress conversation into long-term memory.  {@code msg} is null during auto-compact. */
+    private void handleCompact(Session session, InboundMessage msg) throws InterruptedException {
+        List<Map<String, Object>> all = session.getMessages();
+        if (all.isEmpty()) return;
+
+        List<Map<String, Object>> oldMessages = new ArrayList<>(all);
+        String summary = consolidator.consolidate(oldMessages);
+        if (summary == null) {
+            reply(msg, "[错误] 记忆压缩失败，请稍后重试。");
+            return;
+        }
+
+        try {
+            memStore.append(summary);
+        } catch (IOException e) {
+            log.error("Failed to write memory: {}", e.toString());
+        }
+        session.markConsolidated();
+        log.info("Compacted {} messages → {} chars of memory", all.size(), summary.length());
+
+        reply(msg, "已压缩 " + all.size() + " 条对话为长期记忆。");
+    }
+
+    /** Send a reply to the user if {@code msg} is available (null during auto-compact). */
+    private void reply(InboundMessage msg, String text) throws InterruptedException {
+        if (msg == null) return;
+        bus.publishOutbound(OutboundMessage.builder()
+                .channel(msg.getChannel()).chatId(msg.getChatId())
+                .content(text).build());
+    }
+
+    /** Auto-compact when the session grows beyond the threshold. */
+    private void maybeAutoCompact(Session session) {
+        if (session.getMessages().size() > COMPACT_THRESHOLD) {
+            log.info("Auto-compacting session {} ({} messages)", session.getKey(), session.getMessages().size());
+            // fire-and-forget via a daemon thread to avoid blocking the agent loop
+            var s = session;
+            new Thread(() -> {
+                try {
+                    handleCompact(s, null);
+                } catch (Exception e) {
+                    log.warn("Auto-compact failed: {}", e.toString());
+                }
+            }, "nanobot-compact").start();
+        }
     }
 }

@@ -3,6 +3,7 @@ package com.nanobot;
 import com.nanobot.agent.AgentLoop;
 import com.nanobot.bus.InboundMessage;
 import com.nanobot.bus.MessageBus;
+import com.nanobot.bus.MessageConstants;
 import com.nanobot.bus.OutboundMessage;
 import com.nanobot.session.SessionManager;
 import org.slf4j.Logger;
@@ -93,11 +94,38 @@ public class NanobotApplication {
 
             // ── thread 3: output ─────────────────────────────────
             Thread outputThread = new Thread(() -> {
+                boolean firstToken = true;
                 try {
                     while (true) {
                         OutboundMessage out = bus.consumeOutbound();
                         if ("/exit".equals(out.getContent())) break;
-                        System.out.println("\n🤖 " + out.getContent());
+
+                        Object streamFlag = out.getMetadata() != null
+                                ? out.getMetadata().get(MessageConstants.OUTBOUND_META_STREAM_PROGRESS)
+                                : null;
+                        boolean isStream = Boolean.TRUE.equals(streamFlag);
+
+                        if (isStream) {
+                            // streaming delta — print inline, no newline
+                            if (firstToken) {
+                                System.out.print("\n🤖 ");
+                                firstToken = false;
+                            }
+                            System.out.print(out.getContent());
+                            System.out.flush(); // 行缓冲模式下必须手动刷出
+                        } else {
+                            // non-streaming or final — print with newline
+                            if (!out.getContent().isEmpty()) {
+                                if (firstToken) {
+                                    System.out.print("\n🤖 ");
+                                }
+                                System.out.println(out.getContent());
+                            } else {
+                                // empty content = stream end signal (just newline)
+                                System.out.println();
+                            }
+                            firstToken = true;
+                        }
                     }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();

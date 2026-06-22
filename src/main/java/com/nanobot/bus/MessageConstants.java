@@ -29,4 +29,10 @@ public final class MessageConstants {
 
     /** Runtime control: MCP reload directive. */
     public static final String RUNTIME_CONTROL_MCP_RELOAD = "mcp_reload";
+
+    /**
+     * OutboundMessage.metadata key — when {@code true}, the message is a
+     * streaming delta and should be printed without a trailing newline.
+     */
+    public static final String OUTBOUND_META_STREAM_PROGRESS = "_stream_progress";
 }
