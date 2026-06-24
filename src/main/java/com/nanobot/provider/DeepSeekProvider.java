@@ -2,11 +2,15 @@ package com.nanobot.provider;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+// 引入类型安全的配置类，用于读取 LLM 重试配置
+import com.nanobot.config.NanobotConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
+// 用于捕获 HTTP 错误响应，判断是否可重试
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -39,18 +43,27 @@ public class DeepSeekProvider implements LLMProvider {
 
     private final LlmConfig config;
     private final WebClient client;
+    // LLM API 重试配置：最大重试次数和初始延迟
+    private final int maxRetries;
+    private final long retryDelayMs;
 
-    // ── constructor: load config once, build WebClient ──────────────
+    // ── constructor ──────────────────────────────────────────────────
 
-    public DeepSeekProvider() {
+    /**
+     * 构造函数：初始化 DeepSeek API 客户端和重试配置
+     * @param nanobotConfig 类型安全的配置对象，从 application.yml 读取
+     */
+    public DeepSeekProvider(NanobotConfig nanobotConfig) {
         this.config = LlmConfig.load();
         this.client = WebClient.builder()
                 .baseUrl(config.baseUrl())
                 .defaultHeader("Authorization", "Bearer " + config.apiKey())
                 .defaultHeader("Content-Type", "application/json")
                 .build();
-        log.info("DeepSeekProvider ready  model={}  baseUrl={}  maxTokens={}",
-                config.model(), config.baseUrl(), config.maxTokens());
+        // 从配置中读取重试参数
+        this.maxRetries = nanobotConfig.llm().maxRetries();
+        this.retryDelayMs = nanobotConfig.llm().retryDelayMs();
+        log.info("DeepSeekProvider ready  model={}  maxRetries={}", config.model(), maxRetries);
     }
 
     // ── implementation ──────────────────────────────────────────────
@@ -58,19 +71,61 @@ public class DeepSeekProvider implements LLMProvider {
     @Override
     public LLMResponse chat(List<Map<String, Object>> messages, List<Map<String, Object>> tools) {
         Map<String, Object> body = buildBody(messages, tools, false);
-        try {
-            String raw = client.post()
-                    .uri("/v1/chat/completions")
-                    .bodyValue(body)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .block();
-            return parseResponse(raw);
-        } catch (Exception e) {
-            log.error("DeepSeek API call failed: {}", e.toString());
-            return new LLMResponse("[错误] 调用 DeepSeek API 失败: " + e.getMessage(),
-                    List.of(), "error", Map.of());
+        Exception lastError = null;
+
+        // 重试循环：最多尝试 maxRetries+1 次
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                // 发起 API 调用
+                String raw = client.post()
+                        .uri("/v1/chat/completions")
+                        .bodyValue(body)
+                        .retrieve()
+                        .bodyToMono(String.class)
+                        .block();
+                return parseResponse(raw);  // 成功，解析并返回
+            } catch (WebClientResponseException e) {
+                // HTTP 错误：判断状态码是否可重试
+                int status = e.getStatusCode().value();
+                if (isRetryable(status) && attempt < maxRetries) {
+                    // 指数退避：delay = retryDelayMs * 2^attempt
+                    long delay = retryDelayMs * (1L << attempt);
+                    log.warn("API {} (attempt {}/{}), retrying in {}ms",
+                            status, attempt + 1, maxRetries, delay);
+                    try { Thread.sleep(delay); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                } else {
+                    // 不可重试的错误或已达最大重试次数
+                    lastError = e;
+                    break;
+                }
+            } catch (Exception e) {
+                // 网络错误或其他异常
+                if (attempt < maxRetries) {
+                    long delay = retryDelayMs * (1L << attempt);
+                    log.warn("API network error (attempt {}/{}), retrying in {}ms: {}",
+                            attempt + 1, maxRetries, delay, e.toString());
+                    try { Thread.sleep(delay); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                } else {
+                    lastError = e;
+                }
+            }
         }
+        // 所有重试已耗尽，返回错误响应
+        log.error("All {} retries exhausted: {}", maxRetries,
+                lastError != null ? lastError.toString() : "unknown");
+        return new LLMResponse("[错误] API 调用失败（已重试 " + maxRetries + " 次）: "
+                + (lastError != null ? lastError.getMessage() : "unknown"),
+                List.of(), "error", Map.of());
+    }
+
+    /**
+     * 判断 HTTP 状态码是否为可重试的临时错误
+     * @param status HTTP 状态码
+     * @return true 表示可以重试
+     */
+    private static boolean isRetryable(int status) {
+        // 429: 请求过于频繁, 502/503/504: 服务器临时不可用
+        return status == 429 || status == 503 || status == 502 || status == 504;
     }
 
     // ── request building ───────────────────────────────────────────────

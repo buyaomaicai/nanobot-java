@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nanobot.agent.memory.Consolidator;
 import com.nanobot.agent.memory.MemStore;
 import com.nanobot.bus.InboundMessage;
+// 斜杠命令路由相关类：用于处理 /compact、/help 等命令
+import com.nanobot.command.CommandContext;
+import com.nanobot.command.CommandRouter;
 import com.nanobot.bus.MessageBus;
 import com.nanobot.bus.MessageConstants;
 import com.nanobot.bus.OutboundMessage;
@@ -59,6 +62,8 @@ public class AgentLoop {
     private final ToolRegistry toolRegistry;
     private final String workspace;
     private final ContextBuilder ctxBuilder;
+    // 命令路由器：优先拦截斜杠命令，避免发送到 LLM
+    private final CommandRouter cmdRouter;
     private final MemStore memStore;
     private final Consolidator consolidator;
 
@@ -70,6 +75,7 @@ public class AgentLoop {
                      SessionManager sessions,
                      ToolRegistry toolRegistry,
                      ContextBuilder ctxBuilder,
+                     CommandRouter cmdRouter,  // 注入命令路由器
                      MemStore memStore,
                      @Value("${nanobot.workspace}") String workspace) {
         this.bus = bus;
@@ -77,6 +83,7 @@ public class AgentLoop {
         this.sessions = sessions;
         this.toolRegistry = toolRegistry;
         this.ctxBuilder = ctxBuilder;
+        this.cmdRouter = cmdRouter;  // 保存命令路由器引用
         this.memStore = memStore;
         this.workspace = workspace;
         this.consolidator = new Consolidator(llm);
@@ -94,10 +101,18 @@ public class AgentLoop {
 
         String userContent = msg.getContent();
 
-        // ── /compact 命令：手动触发记忆压缩 ──────────────
-        if ("/compact".equals(userContent)) {
-            handleCompact(session, msg);
-            return;
+        // ── 斜杠命令：优先分发，不发送到 LLM ────────────────────────────
+        // 用户输入以 / 开头时，由 CommandRouter 处理，避免浪费 API 调用
+        if (cmdRouter.isCommand(userContent)) {
+            // 构建命令上下文：包含消息、会话、命令名和参数
+            CommandContext cmdCtx = new CommandContext(msg, session,
+                    commandKey(userContent), userContent, commandArgs(userContent));
+            // 分发到对应的命令处理器
+            OutboundMessage reply = cmdRouter.dispatch(userContent, cmdCtx);
+            if (reply != null) {
+                bus.publishOutbound(reply);
+            }
+            return;  // 命令处理完毕，直接返回
         }
 
         // ① 记录用户消息
@@ -273,50 +288,42 @@ public class AgentLoop {
         return augmented;
     }
 
-    /** Compress conversation into long-term memory.  {@code msg} is null during auto-compact. */
-    private void handleCompact(Session session, InboundMessage msg) throws InterruptedException {
-        List<Map<String, Object>> all = session.getMessages();
-        if (all.isEmpty()) return;
-
-        List<Map<String, Object>> oldMessages = new ArrayList<>(all);
-        String summary = consolidator.consolidate(oldMessages);
-        if (summary == null) {
-            reply(msg, "[错误] 记忆压缩失败，请稍后重试。");
-            return;
-        }
-
-        try {
-            memStore.append(summary);
-        } catch (IOException e) {
-            log.error("Failed to write memory: {}", e.toString());
-        }
-        session.markConsolidated();
-        log.info("Compacted {} messages → {} chars of memory", all.size(), summary.length());
-
-        reply(msg, "已压缩 " + all.size() + " 条对话为长期记忆。");
-    }
-
-    /** Send a reply to the user if {@code msg} is available (null during auto-compact). */
-    private void reply(InboundMessage msg, String text) throws InterruptedException {
-        if (msg == null) return;
-        bus.publishOutbound(OutboundMessage.builder()
-                .channel(msg.getChannel()).chatId(msg.getChatId())
-                .content(text).build());
-    }
-
-    /** Auto-compact when the session grows beyond the threshold. */
+    /** 自动压缩：当会话消息数超过阈值时触发 */
     private void maybeAutoCompact(Session session) {
-        if (session.getMessages().size() > COMPACT_THRESHOLD) {
-            log.info("Auto-compacting session {} ({} messages)", session.getKey(), session.getMessages().size());
-            // fire-and-forget via a daemon thread to avoid blocking the agent loop
-            var s = session;
-            new Thread(() -> {
-                try {
-                    handleCompact(s, null);
-                } catch (Exception e) {
-                    log.warn("Auto-compact failed: {}", e.toString());
+        // 未达阈值，直接返回
+        if (session.getMessages().size() <= COMPACT_THRESHOLD) return;
+        log.info("Auto-compacting session {} ({} messages)", session.getKey(), session.getMessages().size());
+        // 使用守护线程异步执行，避免阻塞主 agent 循环（fire-and-forget 模式）
+        var s = session;
+        new Thread(() -> {
+            try {
+                // 复制消息列表，避免并发修改
+                List<Map<String, Object>> all = new ArrayList<>(s.getMessages());
+                // 调用 LLM 压缩对话为摘要
+                String summary = consolidator.consolidate(all);
+                if (summary != null) {
+                    // 保存到长期记忆文件
+                    memStore.append(summary);
+                    // 标记已压缩，避免重复压缩
+                    s.markConsolidated();
+                    log.info("Auto-compact done: {} messages → {} chars", all.size(), summary.length());
                 }
-            }, "nanobot-compact").start();
-        }
+            } catch (Exception e) {
+                log.warn("Auto-compact failed: {}", e.toString());
+            }
+        }, "nanobot-compact").start();
+    }
+
+    /** 提取命令名称：从 "/compact arg1 arg2" 中提取 "compact" */
+    private static String commandKey(String text) {
+        String t = text.strip().toLowerCase();
+        int sp = t.indexOf(' ');
+        return sp > 0 ? t.substring(1, sp) : t.substring(1);
+    }
+
+    /** 提取命令参数：从 "/compact arg1 arg2" 中提取 "arg1 arg2" */
+    private static String commandArgs(String text) {
+        int sp = text.indexOf(' ');
+        return sp > 0 ? text.substring(sp + 1) : "";
     }
 }

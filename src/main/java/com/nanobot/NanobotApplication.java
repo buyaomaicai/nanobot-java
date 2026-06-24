@@ -11,7 +11,11 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+// 启用基于类型安全的配置属性绑定，从 application.yml 读取 nanobot.* 配置
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
+// 引入类型安全的配置类，替代散落的 @Value 注解
+import com.nanobot.config.NanobotConfig;
 
 import java.util.Scanner;
 
@@ -23,7 +27,9 @@ import java.util.Scanner;
  *   <li><b>Output</b> — consumes outbound → prints to stdout</li>
  * </ol>
  */
+// 启用 NanobotConfig 配置类的自动绑定，实现类型安全的配置管理
 @SpringBootApplication
+@EnableConfigurationProperties(NanobotConfig.class)
 public class NanobotApplication {
 
     private static final Logger log = LoggerFactory.getLogger(NanobotApplication.class);
