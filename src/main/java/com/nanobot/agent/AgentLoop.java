@@ -22,7 +22,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -59,6 +58,7 @@ public class AgentLoop {
     private final SessionManager sessions;
     private final ToolRegistry toolRegistry;
     private final String workspace;
+    private final ContextBuilder ctxBuilder;
     private final MemStore memStore;
     private final Consolidator consolidator;
 
@@ -69,13 +69,16 @@ public class AgentLoop {
                      LLMProvider llm,
                      SessionManager sessions,
                      ToolRegistry toolRegistry,
+                     ContextBuilder ctxBuilder,
+                     MemStore memStore,
                      @Value("${nanobot.workspace}") String workspace) {
         this.bus = bus;
         this.llm = llm;
         this.sessions = sessions;
         this.toolRegistry = toolRegistry;
+        this.ctxBuilder = ctxBuilder;
+        this.memStore = memStore;
         this.workspace = workspace;
-        this.memStore = new MemStore(Path.of(workspace));
         this.consolidator = new Consolidator(llm);
     }
 
@@ -155,17 +158,37 @@ public class AgentLoop {
                 return;
             }
 
-            // ④ 纯文本回复 — 任务完成
+            // ④ 纯文本回复 — finish_reason 分派
             if (!resp.hasToolCalls()) {
-                session.addMessage("assistant", resp.content());
-                // 发送一个空内容消息作为"换行"信号（终端从 \r 模式切换到 \n 模式）
+                String fr = resp.finishReason();
+
+                // length — 输出被 max_tokens 截断，自动续写
+                if ("length".equals(fr) && round < MAX_TOOL_ROUNDS - 1) {
+                    log.debug("Output truncated, requesting continuation (round {})", round);
+                    session.addMessage("assistant", resp.content());
+                    session.addMessage("user",
+                            "请继续，从你刚才被打断的地方接着写。不要重复已经写过的内容。");
+                    continue;
+                }
+
+                // content_filter — 内容被安全策略拦截
+                if ("content_filter".equals(fr)) {
+                    String fallback = "（内容因安全策略被过滤，请尝试换一种表述方式）";
+                    session.addMessage("assistant", fallback);
+                    bus.publishOutbound(OutboundMessage.builder()
+                            .channel(msg.getChannel()).chatId(msg.getChatId())
+                            .content(fallback).build());
+                    return;
+                }
+
+                // stop / error / 其他 — 正常结束
+                session.addMessage("assistant",
+                        resp.content() != null ? resp.content() : "");
                 bus.publishOutbound(OutboundMessage.builder()
-                        .channel(msg.getChannel())
-                        .chatId(msg.getChatId())
-                        .content("")
-                        .build());
-                log.debug("Agent complete  session={}  rounds={}", sessionKey, round + 1);
-                // auto-compact if too many messages
+                        .channel(msg.getChannel()).chatId(msg.getChatId())
+                        .content("").build());  // stream end signal
+                log.debug("Agent complete  session={}  rounds={}  finish={}",
+                        sessionKey, round + 1, fr);
                 maybeAutoCompact(session);
                 return;
             }
@@ -241,16 +264,11 @@ public class AgentLoop {
 
     // ── memory ─────────────────────────────────────────────────────────
 
-    /**
-     * Prepend long-term memory as a system message to the conversation history.
-     * The augmented list is not persisted back to Session.
-     */
+    /** Build the full system prompt and prepend it to the conversation history. */
     private List<Map<String, Object>> augmentWithMemory(List<Map<String, Object>> history) {
-        String memory = memStore.readAll();
-        if (memory.isBlank()) return history;
-
+        String systemPrompt = ctxBuilder.build();
         List<Map<String, Object>> augmented = new ArrayList<>(history.size() + 1);
-        augmented.add(Map.of("role", "system", "content", "## 长期记忆\n" + memory));
+        augmented.add(Map.of("role", "system", "content", systemPrompt));
         augmented.addAll(history);
         return augmented;
     }

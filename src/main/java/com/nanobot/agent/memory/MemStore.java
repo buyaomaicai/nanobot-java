@@ -2,6 +2,8 @@ package com.nanobot.agent.memory;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -36,6 +38,7 @@ import java.time.format.DateTimeFormatter;
  * 用户修复了数据库连接问题，关键原因是……
  * }</pre>
  */
+@Component
 public class MemStore {
 
     private static final Logger log = LoggerFactory.getLogger(MemStore.class);
@@ -62,8 +65,8 @@ public class MemStore {
      *
      * @param workspace 项目工作目录的根路径
      */
-    public MemStore(Path workspace) {
-        this.memoryFile = workspace.resolve("memory").resolve("MEMORY.md");
+    public MemStore(@Value("${nanobot.workspace}") String workspace) {
+        this.memoryFile = Path.of(workspace).resolve("memory").resolve("MEMORY.md");
     }
 
     // ── 读取操作 ──────────────────────────────────────────────────────────
